@@ -6,6 +6,10 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+import geopandas as gpd
+import unicodedata
+from matplotlib.colors import TwoSlopeNorm
+
 from src.config import (
     MODEL_WITH_YEAR_PATH,
     MODEL_NO_YEAR_PATH,
@@ -34,11 +38,90 @@ def get_data():
     return barley, climate
 
 
+
 @st.cache_resource
 def load_models():
     m_with = joblib.load(MODEL_WITH_YEAR_PATH)
     m_no = joblib.load(MODEL_NO_YEAR_PATH)
     return m_with, m_no
+
+
+def norm_name(s):
+    if pd.isna(s):
+        return s
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    s = s.lower()
+    s = s.replace(" ", "_").replace("-", "_").replace("'", "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
+
+def plot_risk_map(deps_gdf, risk_tbl, metric="loss_tonnes", title=None, diverging_center_zero=True):
+    """
+    deps_gdf: GeoDataFrame with 'dep_key' and geometry
+    risk_tbl: DataFrame with 'department' + metric column
+    metric: one of ['loss_tonnes', 'loss_eur', 'downside_gap', 'std', 'p10', ...]
+    """
+
+    risk_map = risk_tbl[["department", metric]].copy()
+    risk_map["dep_key"] = risk_map["department"].map(norm_name)
+
+    plot_gdf = deps_gdf.merge(risk_map[["dep_key", metric]], on="dep_key", how="left")
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+
+    # Choose colormap
+    # - For risk/exposure metrics: higher = worse => red. Use RdYlGn_r (green low, red high).
+    cmap = "RdYlGn_r"
+
+    if diverging_center_zero:
+        vals = plot_gdf[metric].dropna()
+        if len(vals) > 0:
+            # soften extremes so the map isn't "all yellow"
+            vmin = np.percentile(vals, 5)
+            vmax = np.percentile(vals, 95)
+
+            # ensure 0 is inside the range for TwoSlopeNorm; fallback if not
+            if vmin < 0 < vmax:
+                norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
+            else:
+                norm = None
+        else:
+            norm = None
+    else:
+        norm = None
+
+    plot_gdf.plot(
+        column=metric,
+        cmap=cmap,
+        norm=norm,
+        legend=False,  # <- you requested no legend
+        linewidth=0.3,
+        edgecolor="white",
+        missing_kwds={"color": "lightgrey"},
+        ax=ax
+    )
+
+    ax.axis("off")
+    plt.tight_layout()
+
+    return fig
+
+
+@st.cache_resource
+def load_deps_geo():
+    url = "https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/departements.geojson"
+
+    gdf = gpd.read_file(url)
+
+    # In this geojson, the department name column is "nom"
+    name_col = "nom"
+    if name_col not in gdf.columns:
+        raise ValueError(f"Expected '{name_col}' in geojson columns. Found: {list(gdf.columns)}")
+
+    gdf["dep_key"] = gdf[name_col].map(norm_name)
+
+    return gdf
 
 
 def scenario_id_from_label(label: str) -> str:
@@ -53,7 +136,7 @@ def plot_single_scenario_line(df_plot: pd.DataFrame, title: str):
     plt.plot(df_plot["year"], df_plot["yield_pred"])
     plt.title(title)
     plt.xlabel("Year (crop year / harvest)")
-    plt.ylabel("Predicted yield (t/ha)")
+    plt.ylabel("Predicted yield (kg/ha)")
     plt.tight_layout()
     st.pyplot(fig)
 
@@ -92,7 +175,7 @@ def metrics_from_department_view(yield_t_ha: float, area_ha: float, price_eur_t:
     eur = tonnes * price_eur_t
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Yield (t/ha)", f"{yield_t_ha:.2f}")
+    c1.metric("Yield (kg/ha)", f"{yield_t_ha:.2f}")
     c2.metric("Production (t)", f"{tonnes:,.0f}")
     c3.metric("Value (€)", f"{eur:,.0f}")
 
@@ -111,7 +194,7 @@ def metrics_from_all_departments_view(df_year_dep: pd.DataFrame, area_mean_tbl: 
     c2.metric("Production (t)", f"{total_production:,.0f}")
     c3.metric("Value (€)", f"{total_value:,.0f}")
 
-    st.caption(f"Area-weighted yield: {yield_weighted:.2f} t/ha")
+    st.caption(f"Area-weighted yield: {yield_weighted:.2f} kg/ha")
 
 
 def add_climate_indices(df: pd.DataFrame) -> pd.DataFrame:
@@ -403,10 +486,38 @@ def main():
                 s = snap.iloc[0]
                 st.markdown("#### Selected department snapshot")
                 a, b, c, d = st.columns(4)
-                a.metric("Severe-year yield (p10, t/ha)", f"{s['p10']:.2f}")
-                b.metric("Downside gap (t/ha)", f"{s['downside_gap']:.2f}")
-                c.metric("Loss (t)", f"{s['loss_tonnes']:,.0f}")
+                a.metric("Severe-year yield (p10, kg/ha)", f"{s['p10']:.2f}")
+                b.metric("Downside gap (kg/ha)", f"{s['downside_gap']:.2f}")
+                c.metric("Loss (kg)", f"{s['loss_tonnes']:,.0f}")
                 d.metric("Loss (€)", f"{s['loss_eur']:,.0f}")
+
+        deps_gdf = load_deps_geo()
+
+        st.markdown("#### Risk map")
+
+        map_metric = st.selectbox(
+            "Map metric",
+            ["risk_score"],
+            index=0
+        )
+
+        metric_map_lookup = {
+            "loss_tonnes": "loss_tonnes",
+            "risk_score": "risk_score",
+        }
+        metric_to_plot = metric_map_lookup[map_metric]
+
+        fig = plot_risk_map(
+            deps_gdf=deps_gdf,
+            risk_tbl=risk_tbl,
+            metric=metric_to_plot,
+            title=f"{map_metric} — {scen_risk_label} | {win_start}-{win_end}",
+            diverging_center_zero=(metric_to_plot in ["loss_tonnes", "loss_eur", "downside_gap"])
+        )
+
+        col1, col2, col3 = st.columns([1,2,1])  # center column bigger
+        with col2:
+            st.pyplot(fig)
 
         st.markdown("#### Ranking")
 
