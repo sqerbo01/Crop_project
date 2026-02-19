@@ -13,7 +13,7 @@ from matplotlib.colors import TwoSlopeNorm
 from src.config import (
     MODEL_WITH_YEAR_PATH,
     MODEL_NO_YEAR_PATH,
-    DEFAULT_PRICE_EUR_PER_TONNE,
+    DEFAULT_PRICE_EUR_PER_kg,
     DEFAULT_RISK_WINDOW_START,
     DEFAULT_RISK_WINDOW_END,
     SCENARIOS_FUTURE,
@@ -56,55 +56,61 @@ def norm_name(s):
         s = s.replace("__", "_")
     return s.strip("_")
 
-def plot_risk_map(deps_gdf, risk_tbl, metric="loss_tonnes", title=None, diverging_center_zero=True):
-    """
-    deps_gdf: GeoDataFrame with 'dep_key' and geometry
-    risk_tbl: DataFrame with 'department' + metric column
-    metric: one of ['loss_tonnes', 'loss_eur', 'downside_gap', 'std', 'p10', ...]
-    """
-
+def plot_risk_map(
+    deps_gdf,
+    risk_tbl,
+    metric="loss_kg",
+    title=None,
+    diverging_center_zero=True,
+    highlight_dep: str | None = None,
+):
     risk_map = risk_tbl[["department", metric]].copy()
     risk_map["dep_key"] = risk_map["department"].map(norm_name)
 
     plot_gdf = deps_gdf.merge(risk_map[["dep_key", metric]], on="dep_key", how="left")
 
     fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-
-    # Choose colormap
-    # - For risk/exposure metrics: higher = worse => red. Use RdYlGn_r (green low, red high).
     cmap = "RdYlGn_r"
 
+    norm = None
     if diverging_center_zero:
         vals = plot_gdf[metric].dropna()
         if len(vals) > 0:
-            # soften extremes so the map isn't "all yellow"
             vmin = np.percentile(vals, 5)
             vmax = np.percentile(vals, 95)
-
-            # ensure 0 is inside the range for TwoSlopeNorm; fallback if not
             if vmin < 0 < vmax:
                 norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
-            else:
-                norm = None
-        else:
-            norm = None
-    else:
-        norm = None
 
     plot_gdf.plot(
         column=metric,
         cmap=cmap,
         norm=norm,
-        legend=False,  # <- you requested no legend
+        legend=False,
         linewidth=0.3,
         edgecolor="white",
         missing_kwds={"color": "lightgrey"},
-        ax=ax
+        ax=ax,
     )
+
+    # ✅ Highlight selected department
+    if highlight_dep and highlight_dep != "All":
+        key = norm_name(highlight_dep)
+        sel = plot_gdf[plot_gdf["dep_key"] == key]
+        if not sel.empty:
+            sel.boundary.plot(ax=ax, linewidth=2.5, edgecolor="black")
+            # optional: add label in centroid
+            try:
+                cx = sel.geometry.centroid.x.values[0]
+                cy = sel.geometry.centroid.y.values[0]
+                ax.text(cx, cy, highlight_dep, fontsize=7, ha="center", va="center")
+            except Exception:
+                pass
+
+    if title:
+        ax.set_title(title, fontsize=10)
 
     ax.axis("off")
     plt.tight_layout()
-
     return fig
 
 
@@ -169,14 +175,132 @@ def build_future_predictions(
     df_future["yield_pred"] = pipe.predict(df_future[feature_cols])
     return df_future
 
+def compute_thresholds(risk_tbl: pd.DataFrame) -> dict:
+    # Robust quantile thresholds (change q levels if you want)
+    q = lambda col, p: float(risk_tbl[col].dropna().quantile(p)) if col in risk_tbl else np.nan
+
+    return {
+        "risk_high": q("risk_score", 0.80),
+        "risk_low":  q("risk_score", 0.20),
+
+        "loss_high": q("loss_kg", 0.80),        # big losses
+        "loss_low":  q("loss_kg", 0.20),
+
+        "ws_high":   q("avg_water_stress_index", 0.80),
+        "ws_low":    q("avg_water_stress_index", 0.20),
+
+        "temp_sens_high": q("climate_sensitivity_temp", 0.80),
+        "prec_sens_high": q("climate_sensitivity_precip", 0.80),
+    }
+
+
+def recommendations_portfolio(risk_tbl: pd.DataFrame, th: dict) -> str:
+    # sort tables
+    most_risky = risk_tbl.sort_values(["risk_score", "loss_kg"], ascending=False)
+    safest = risk_tbl.sort_values(["risk_score", "avg_water_stress_index"], ascending=True)
+
+    top10_risk = most_risky.head(10)["department"]
+    alt_lowrisk = safest.head(8)["department"]
+
+    high_ws = risk_tbl[risk_tbl["avg_water_stress_index"] >= th["ws_high"]].sort_values(
+        "avg_water_stress_index", ascending=False
+    )["department"].head(8)
+
+    # optional: "opportunity" = projected improvement vs historical (negative loss)
+    opp = risk_tbl[risk_tbl["loss_kg"] < 0].sort_values("loss_kg").head(5)["department"]
+
+    txt = f"""
+    **Recommended sourcing shifts (rule-based)**
+
+    **1) Reallocate volumes away from the highest-risk departments (Top 10):**  
+    {top_n_list(top10_risk, 10)}  
+    → Reduce medium-term contract exposure and prioritize mitigation-only support (no expansion).
+
+    **2) Prioritize contracting in structurally resilient departments (low risk + low water stress):**  
+    {top_n_list(alt_lowrisk, 8)}  
+    → Use these as “anchor basins” for longer-term sourcing and multi-year contracts.
+
+    **3) Avoid expansion in high water-stress departments (likely higher irrigation costs):**  
+    {top_n_list(high_ws, 8)}  
+    → Cap incremental volumes; focus on water-efficient practices if sourcing is unavoidable.
+
+    **4) Quick-win opportunities (projected improvement vs historical mean):**  
+    {top_n_list(opp, 5)}  
+    → Consider selective upside allocation where climate conditions improve.
+    """
+    return txt
+
+def recommendations_department(risk_tbl: pd.DataFrame, dep: str, th: dict) -> str:
+    row = risk_tbl[risk_tbl["department"] == dep]
+    if row.empty:
+        return "No recommendation available (department not found)."
+
+    s = row.iloc[0]
+
+    risk = float(s.get("risk_score", np.nan))
+    loss = float(s.get("loss_kg", np.nan))
+    ws   = float(s.get("avg_water_stress_index", np.nan))
+
+    flags = []
+    actions = []
+
+    # Risk / loss
+    if np.isfinite(risk) and risk >= th["risk_high"]:
+        flags.append("**High structural climate risk**")
+        actions.append("Avoid increasing volumes; renegotiate contracts with flexibility (volume bands / optionality).")
+
+    if np.isfinite(loss) and loss >= th["loss_high"]:
+        flags.append("**High downside exposure (kg)**")
+        actions.append("Prioritize mitigation: agronomic support, varietal trials, and contingency sourcing plans.")
+
+    if np.isfinite(loss) and loss < 0:
+        flags.append("**Projected opportunity vs historical**")
+        actions.append("Consider selective volume increase, but keep monitoring volatility and water stress.")
+
+    # Water stress
+    if np.isfinite(ws) and ws >= th["ws_high"]:
+        flags.append("**High water stress**")
+        actions.append("Limit exposure to irrigation costs: cap expansion and require water-efficiency commitments from growers.")
+    elif np.isfinite(ws) and ws <= th["ws_low"]:
+        flags.append("**Low water stress**")
+        actions.append("Good candidate for longer-term contracting (more stable cost profile).")
+
+    # Sensitivities (optional)
+    t_sens = float(s.get("climate_sensitivity_temp", np.nan))
+    p_sens = float(s.get("climate_sensitivity_precip", np.nan))
+
+    if np.isfinite(t_sens) and t_sens >= th["temp_sens_high"]:
+        actions.append("High temperature sensitivity: prioritize heat-tolerant varieties and adjust sowing/harvest planning.")
+    if np.isfinite(p_sens) and p_sens >= th["prec_sens_high"]:
+        actions.append("High precipitation sensitivity: improve drainage/soil practices; review flood/excess rain exposure.")
+
+    if not flags:
+        flags = ["**Moderate risk profile**"]
+    if not actions:
+        actions = ["Maintain current sourcing; monitor annually and trigger review if risk moves into top quintile."]
+
+    actions_md = "\n".join([f"- {a}" for a in actions])
+
+    txt = (
+        f"**Department recommendation — {dep}**\n\n"
+        f"**Risk signals:** {' · '.join(flags)}\n\n"
+        f"**Recommended actions:**\n"
+        f"{actions_md}"
+    )
+    return txt
+
+def top_n_list(series: pd.Series, n=5) -> str:
+    vals = [v for v in series.dropna().astype(str).tolist()][:n]
+    return ", ".join(vals) if vals else "—"
+
 
 def metrics_from_department_view(yield_t_ha: float, area_ha: float, price_eur_t: float):
-    tonnes = yield_t_ha * area_ha
-    eur = tonnes * price_eur_t
+    kg = yield_t_ha * area_ha
+    eur = kg * price_eur_t
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Yield (kg/ha)", f"{yield_t_ha:.2f}")
-    c2.metric("Production (t)", f"{tonnes:,.0f}")
+    c2.metric("Production (kg)", f"{kg:,.0f}")
     c3.metric("Value (€)", f"{eur:,.0f}")
 
 
@@ -191,7 +315,7 @@ def metrics_from_all_departments_view(df_year_dep: pd.DataFrame, area_mean_tbl: 
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Area (ha)", f"{total_area:,.0f}")
-    c2.metric("Production (t)", f"{total_production:,.0f}")
+    c2.metric("Production (kg)", f"{total_production:,.0f}")
     c3.metric("Value (€)", f"{total_value:,.0f}")
 
     st.caption(f"Area-weighted yield: {yield_weighted:.2f} kg/ha")
@@ -303,7 +427,7 @@ def main():
         dep = st.selectbox(
             "Department",
             department_options,
-            index=department_options.index("Yvelines") if "Yvelines" in department_options else 0,
+            index=department_options.index("All") if "All" in department_options else 0,
         )
 
         scenario_label = st.selectbox(
@@ -317,9 +441,9 @@ def main():
         year_max = st.slider("End year", 2019, 2050, 2050)
 
         price = st.number_input(
-            "Price (€/tonne)",
+            "Price (€/kg)",
             min_value=0.0,
-            value=float(DEFAULT_PRICE_EUR_PER_TONNE),
+            value=float(DEFAULT_PRICE_EUR_PER_kg),
             step=10.0,
         )
 
@@ -337,7 +461,7 @@ def main():
             )
 
     # Tab names updated as requested
-    tab1, tab2, tab3 = st.tabs(["Forecast", "Climate-only", "Risk"])
+    tab1, tab2 = st.tabs(["Forecast", "Risk"])
 
     # ---------- TAB 1 ----------
     with tab1:
@@ -385,50 +509,6 @@ def main():
 
     # ---------- TAB 2 ----------
     with tab2:
-        st.subheader("Climate-only")
-
-        df_future = build_future_predictions(
-            climate=climate,
-            departments=dept_set,
-            scenario=scenario,
-            year_min=year_min,
-            year_max=year_max,
-            model_artifact=model_no,
-        )
-
-        if dep == "All":
-            st.caption("Portfolio-level view across all departments (area-weighted).")
-
-            df_plot = (
-                df_future.merge(area_mean_tbl, on="department", how="left")
-                .assign(production_t=lambda d: d["yield_pred"] * d["area_mean"])
-                .groupby("year", as_index=False)
-                .agg(total_production_t=("production_t", "sum"), total_area=("area_mean", "sum"))
-            )
-            df_plot["yield_pred"] = df_plot["total_production_t"] / df_plot["total_area"]
-            df_plot = df_plot[["year", "yield_pred"]].sort_values("year")
-
-            last_year = int(df_plot["year"].max())
-            df_last = df_future[df_future["year"] == last_year][["department", "yield_pred"]].copy()
-            metrics_from_all_departments_view(df_last, area_mean_tbl, float(price))
-
-            plot_single_scenario_line(df_plot, f"Climate-only yield projection – All departments – {scenario_label}")
-
-        else:
-            df_dep = df_future[df_future["department"] == dep].copy()
-            if df_dep.empty:
-                st.warning("No data for the selected department.")
-            else:
-                df_plot = df_dep.groupby("year", as_index=False)["yield_pred"].mean().sort_values("year")
-
-                last_year = int(df_plot["year"].max())
-                last_yield = float(df_plot[df_plot["year"] == last_year]["yield_pred"].iloc[0])
-                metrics_from_department_view(last_yield, float(area), float(price))
-
-                plot_single_scenario_line(df_plot, f"Climate-only yield projection – {dep} – {scenario_label}")
-
-    # ---------- TAB 3 ----------
-    with tab3:
         st.subheader("Risk ranking (portfolio view)")
 
         c1, c2, c3 = st.columns(3)
@@ -472,7 +552,7 @@ def main():
             risk_tbl=risk_tbl,
             historical_mean=hist_mean,
             area_mean=area_mean_tbl,
-            price_eur_per_tonne=float(price),
+            price_eur_per_kg=float(price),
             downside_only=downside_only,
         )
 
@@ -484,11 +564,11 @@ def main():
             snap = risk_tbl[risk_tbl["department"] == dep]
             if not snap.empty:
                 s = snap.iloc[0]
-                st.markdown("#### Selected department snapshot")
+                st.markdown("#### Key metrics for selected department")
                 a, b, c, d = st.columns(4)
                 a.metric("Severe-year yield (p10, kg/ha)", f"{s['p10']:.2f}")
                 b.metric("Downside gap (kg/ha)", f"{s['downside_gap']:.2f}")
-                c.metric("Loss (kg)", f"{s['loss_tonnes']:,.0f}")
+                c.metric("Loss (kg)", f"{s['loss_kg']:,.0f}")
                 d.metric("Loss (€)", f"{s['loss_eur']:,.0f}")
 
         deps_gdf = load_deps_geo()
@@ -502,7 +582,7 @@ def main():
         )
 
         metric_map_lookup = {
-            "loss_tonnes": "loss_tonnes",
+            "loss_kg": "loss_kg",
             "risk_score": "risk_score",
         }
         metric_to_plot = metric_map_lookup[map_metric]
@@ -512,19 +592,29 @@ def main():
             risk_tbl=risk_tbl,
             metric=metric_to_plot,
             title=f"{map_metric} — {scen_risk_label} | {win_start}-{win_end}",
-            diverging_center_zero=(metric_to_plot in ["loss_tonnes", "loss_eur", "downside_gap"])
+            diverging_center_zero=(metric_to_plot in ["loss_kg", "loss_eur", "downside_gap"]),
+            highlight_dep=dep,   # ✅ add this
         )
 
         col1, col2, col3 = st.columns([1,2,1])  # center column bigger
         with col2:
             st.pyplot(fig)
 
+        st.markdown("### Recommendations")
+
+        th = compute_thresholds(risk_tbl)
+
+        if dep == "All":
+            st.markdown(recommendations_portfolio(risk_tbl, th))
+        else:
+            st.markdown(recommendations_department(risk_tbl, dep, th))
+
         st.markdown("#### Ranking")
 
         # Remove risk_score from display, rename p10 to a clearer label,
-        # and sort by Loss tonnes (descending = biggest losses first).
+        # and sort by Loss kg (descending = biggest losses first).
         display_tbl = risk_tbl.copy()
-        display_tbl = display_tbl.sort_values("loss_tonnes", ascending=False).reset_index(drop=True)
+        display_tbl = display_tbl.sort_values("loss_kg", ascending=False).reset_index(drop=True)
 
         display_tbl = display_tbl.rename(
             columns={
@@ -542,7 +632,7 @@ def main():
         "historical_mean",
         "downside_gap",
         "area_mean",
-        "loss_tonnes",
+        "loss_kg",
         "loss_eur",
         "avg_water_stress_index",
         "climate_sensitivity_temp",

@@ -54,7 +54,7 @@ def add_financial_impact(
     risk_tbl: pd.DataFrame,
     historical_mean: pd.DataFrame,
     area_mean: pd.DataFrame,
-    price_eur_per_tonne: float,
+    price_eur_per_kg: float,
     downside_only: bool,
 ) -> pd.DataFrame:
     out = risk_tbl.merge(historical_mean, on="department", how="left").merge(area_mean, on="department", how="left")
@@ -64,6 +64,6 @@ def add_financial_impact(
     if downside_only:
         out["downside_gap"] = out["downside_gap"].clip(lower=0.0)
 
-    out["loss_tonnes"] = out["downside_gap"] * out["area_mean"]
-    out["loss_eur"] = out["loss_tonnes"] * price_eur_per_tonne
+    out["loss_kg"] = out["downside_gap"] * out["area_mean"]
+    out["loss_eur"] = out["loss_kg"] * price_eur_per_kg
     return out
